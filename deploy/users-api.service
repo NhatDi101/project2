@@ -5,8 +5,8 @@ After=network-online.target
 
 [Service]
 Type=exec
-User=users-api
-Group=users-api
+User=sysadmin
+Group=sysadmin
 WorkingDirectory=/opt/users-api
 # Store this file outside the deployed source directory; it contains DB_PASSWORD.
 EnvironmentFile=/etc/users-api/users-api.env
