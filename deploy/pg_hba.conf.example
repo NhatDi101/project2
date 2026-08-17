@@ -1,0 +1,3 @@
+# Add this rule to pg_hba.conf, then reload/restart PostgreSQL.
+# TYPE  DATABASE  USER      ADDRESS         METHOD
+host    users_db  app_user  127.0.0.1/32    scram-sha-256

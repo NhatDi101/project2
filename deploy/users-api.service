@@ -1,0 +1,27 @@
+[Unit]
+Description=Local Flask Users API
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=exec
+User=users-api
+Group=users-api
+WorkingDirectory=/opt/users-api
+# Store this file outside the deployed source directory; it contains DB_PASSWORD.
+EnvironmentFile=/etc/users-api/users-api.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/users-api/.venv/bin/gunicorn --workers 2 --bind 127.0.0.1:8000 --access-logfile - --error-logfile - app:app
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
