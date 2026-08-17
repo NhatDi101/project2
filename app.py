@@ -1,13 +1,13 @@
-"""Local-only Flask API backed by PostgreSQL."""
+"""Local-only Flask API backed by MySQL."""
 
 import logging
 import os
 import sys
+from contextlib import contextmanager
 
-import psycopg
+import mysql.connector
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
-from psycopg.rows import dict_row
 
 # For local development this loads .env. Existing environment variables (such
 # as systemd's EnvironmentFile) always take precedence.
@@ -34,7 +34,7 @@ logger = configure_logger()
 
 
 def read_database_config() -> dict[str, object]:
-    """Load every database connection value from environment variables only."""
+    """Load every MySQL connection value from environment variables only."""
     required = ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD")
     missing = [name for name in required if not os.getenv(name)]
     if missing:
@@ -48,10 +48,10 @@ def read_database_config() -> dict[str, object]:
     return {
         "host": os.environ["DB_HOST"],
         "port": port,
-        "dbname": os.environ["DB_NAME"],
+        "database": os.environ["DB_NAME"],
         "user": os.environ["DB_USER"],
         "password": os.environ["DB_PASSWORD"],
-        "connect_timeout": 5,
+        "connection_timeout": 5,
     }
 
 
@@ -59,29 +59,30 @@ database_config = read_database_config()
 app = Flask(__name__)
 
 
-def connect_to_database():
-    """Create a short-lived PostgreSQL connection for one request."""
-    return psycopg.connect(**database_config, row_factory=dict_row)
+@contextmanager
+def database_connection():
+    """Open and close one MySQL connection safely for each operation."""
+    connection = mysql.connector.connect(**database_config)
+    try:
+        yield connection
+    finally:
+        connection.close()
 
 
-def initialize_database() -> None:
-    """Create the table on first start; no user data is kept in application RAM."""
-    with connect_to_database() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                    name VARCHAR(255) NOT NULL CHECK (char_length(trim(name)) > 0),
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
+def verify_database() -> None:
+    """Fail startup if MySQL or the pre-provisioned users table is unavailable."""
+    with database_connection() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute("SELECT 1 FROM users LIMIT 1")
+        finally:
+            cursor.close()
+
     logger.info(
-        "PostgreSQL connection verified (host=%s port=%s database=%s user=%s)",
+        "MySQL connection verified (host=%s port=%s database=%s user=%s)",
         database_config["host"],
         database_config["port"],
-        database_config["dbname"],
+        database_config["database"],
         database_config["user"],
     )
 
@@ -102,34 +103,40 @@ def index():
 
 @app.get("/health")
 def health_check():
-    """Return healthy only when the PostgreSQL connection works."""
+    """Return healthy only when the MySQL connection works."""
     try:
-        with connect_to_database() as connection:
-            with connection.cursor() as cursor:
+        with database_connection() as connection:
+            cursor = connection.cursor()
+            try:
                 cursor.execute("SELECT 1")
+            finally:
+                cursor.close()
         return jsonify(status="ok"), 200
-    except psycopg.Error:
-        logger.exception("Health check could not connect to PostgreSQL")
+    except mysql.connector.Error:
+        logger.exception("Health check could not connect to MySQL")
         return jsonify(status="unavailable"), 503
 
 
 @app.get("/api/users")
 def list_users():
-    """Read users from PostgreSQL."""
+    """Read users from MySQL."""
     try:
-        with connect_to_database() as connection:
-            with connection.cursor() as cursor:
+        with database_connection() as connection:
+            cursor = connection.cursor(dictionary=True)
+            try:
                 cursor.execute("SELECT id, name, created_at FROM users ORDER BY id")
                 users = cursor.fetchall()
+            finally:
+                cursor.close()
         return jsonify(users), 200
-    except psycopg.Error:
-        logger.exception("Could not read users from PostgreSQL")
+    except mysql.connector.Error:
+        logger.exception("Could not read users from MySQL")
         return jsonify(error="database temporarily unavailable"), 503
 
 
 @app.post("/api/users")
 def create_user():
-    """Create a user in PostgreSQL from {\"name\": \"Lan\"}."""
+    """Create a user in MySQL from {\"name\": \"Lan\"}."""
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict) or not isinstance(payload.get("name"), str):
         return jsonify(error="JSON body must include a string field: name"), 400
@@ -141,23 +148,28 @@ def create_user():
         return jsonify(error="name must contain at most 255 characters"), 400
 
     try:
-        with connect_to_database() as connection:
-            with connection.cursor() as cursor:
+        with database_connection() as connection:
+            cursor = connection.cursor(dictionary=True)
+            try:
+                cursor.execute("INSERT INTO users (name) VALUES (%s)", (name,))
+                user_id = cursor.lastrowid
+                connection.commit()
                 cursor.execute(
-                    "INSERT INTO users (name) VALUES (%s) RETURNING id, name, created_at",
-                    (name,),
+                    "SELECT id, name, created_at FROM users WHERE id = %s", (user_id,)
                 )
                 user = cursor.fetchone()
+            finally:
+                cursor.close()
         logger.info("Created user id=%s", user["id"])
         return jsonify(user), 201
-    except psycopg.Error:
-        logger.exception("Could not create user in PostgreSQL")
+    except mysql.connector.Error:
+        logger.exception("Could not create user in MySQL")
         return jsonify(error="database temporarily unavailable"), 503
 
 
-# A database failure during startup makes the process exit. systemd's
-# Restart=on-failure will then retry instead of running a broken service.
-initialize_database()
+# Database/schema failures cause process startup to fail. systemd's
+# Restart=on-failure then retries instead of running a broken service.
+verify_database()
 
 
 if __name__ == "__main__":

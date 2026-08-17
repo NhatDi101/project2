@@ -1,7 +1,7 @@
 [Unit]
 Description=Local Flask Users API
-After=network.target postgresql.service
-Wants=postgresql.service
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=exec

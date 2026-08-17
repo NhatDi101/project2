@@ -1,0 +1,6 @@
+# Add these settings under the [mysqld] section of the MySQL server config.
+# MySQL (including its optional X Protocol listener) then accepts connections
+# only from the local machine.
+[mysqld]
+bind-address = 127.0.0.1
+mysqlx-bind-address = 127.0.0.1

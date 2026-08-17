@@ -1,40 +1,61 @@
-# Flask Users API with PostgreSQL and systemd
+# Flask Users API with MySQL and systemd
 
-The API binds only to `127.0.0.1:8000`; Nginx or Apache can proxy requests to
-it. User records are stored in PostgreSQL, not in application memory.
+The service is the application/database component of the project. It listens
+only on `127.0.0.1:8000`; Nginx or Apache can proxy requests to it. User data is
+stored in MySQL, not in application memory.
 
-## 1. Configure PostgreSQL (Linux)
+## 1. Configure MySQL on Linux
 
-Install PostgreSQL using your distribution's package manager. Create an
-application account and database, then choose the password when prompted:
-
-```bash
-sudo -u postgres createuser --pwprompt app_user
-sudo -u postgres createdb --owner=app_user users_db
-```
-
-Set PostgreSQL to accept TCP connections only on the loopback interface. Add
-the contents of [deploy/postgresql-local.conf](deploy/postgresql-local.conf)
-to the server's `postgresql.conf`. Add the rule from
-[deploy/pg_hba.conf.example](deploy/pg_hba.conf.example) to `pg_hba.conf`, then
-restart PostgreSQL:
+Install MySQL Server. Configure its TCP listeners to stay on loopback by
+installing [deploy/mysql-local.cnf](deploy/mysql-local.cnf):
 
 ```bash
-sudo systemctl restart postgresql
-sudo ss -ltnp | grep 5432
+# Ubuntu/Debian
+sudo install -m 0644 deploy/mysql-local.cnf /etc/mysql/conf.d/users-api-local.cnf
+sudo systemctl restart mysql
+
+# CentOS Stream with MySQL Server packages
+sudo install -m 0644 deploy/mysql-local.cnf /etc/my.cnf.d/users-api-local.cnf
+sudo systemctl restart mysqld
 ```
 
-The last command must show `127.0.0.1:5432` and must not show `0.0.0.0:5432`
-or `[::]:5432`.
+Verify MySQL is not exposed to the network. The output may show port `3306`
+and, if enabled, X Protocol port `33060`, but both must use `127.0.0.1`:
+
+```bash
+sudo ss -ltnp | grep -E '3306|33060'
+```
+
+Open the MySQL administrator prompt and provision the database/table using the
+schema file. The application account is deliberately not an owner and cannot
+alter schema:
+
+```bash
+sudo mysql
+```
+
+At the `mysql>` prompt, run the following. Replace only the placeholder with a
+password chosen for the running server; never place that password in this
+repository or report.
+
+```sql
+SOURCE /absolute/path/to/project/deploy/mysql-schema.sql;
+CREATE USER 'app_user'@'127.0.0.1' IDENTIFIED BY '<APP_DB_PASSWORD>';
+GRANT SELECT, INSERT ON users_db.users TO 'app_user'@'127.0.0.1';
+```
+
+If the user already exists, use `ALTER USER` instead of `CREATE USER`. The app
+needs only `SELECT` and `INSERT`; it has no `CREATE`, `ALTER`, `DROP`, or MySQL
+administrator privilege.
 
 ## 2. Run locally
 
-Copy the example configuration and set the actual database password. `.env` is
-ignored by Git and is loaded automatically only for local development.
+Copy the example configuration and fill in the database password used above.
+`.env` is ignored by Git and loaded only for local development.
 
 ```bash
 cp .env.example .env
-# Edit .env: set DB_PASSWORD to the password selected above.
+# Edit .env and set DB_PASSWORD.
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
@@ -51,14 +72,14 @@ pip install -r requirements.txt
 python app.py
 ```
 
-The first application startup creates the `users` table automatically. Open
-`http://127.0.0.1:8000/health`; a `200` response means Flask can connect to
-PostgreSQL.
+At startup the application verifies it can access the pre-created `users`
+table. Open `http://127.0.0.1:8000/health`; HTTP 200 means Flask can reach
+MySQL.
 
 ## 3. Install as a systemd service
 
-Deploy this project to `/opt/users-api`, create a dedicated unprivileged user,
-and install its Python dependencies:
+Deploy the project to `/opt/users-api`, create a dedicated unprivileged Linux
+account, and install dependencies:
 
 ```bash
 sudo useradd --system --home-dir /opt/users-api --shell /usr/sbin/nologin users-api
@@ -67,8 +88,8 @@ sudo -u users-api python3 -m venv /opt/users-api/.venv
 sudo -u users-api /opt/users-api/.venv/bin/pip install -r /opt/users-api/requirements.txt
 ```
 
-Keep the production password outside the source tree. Copy the example file,
-edit it, and make it readable only to the service account:
+Keep the production secret outside the source directory. The service reads this
+file through `EnvironmentFile=`:
 
 ```bash
 sudo install -d -o root -g users-api -m 0750 /etc/users-api
@@ -78,7 +99,7 @@ sudo chmod 0640 /etc/users-api/users-api.env
 sudoedit /etc/users-api/users-api.env
 ```
 
-Install and start the unit:
+Install and enable the unit:
 
 ```bash
 sudo cp /opt/users-api/deploy/users-api.service /etc/systemd/system/users-api.service
@@ -87,12 +108,21 @@ sudo systemctl enable --now users-api
 sudo systemctl status users-api
 ```
 
-The unit uses `Restart=on-failure` with a five-second delay, so it starts after
-boot and restarts if Gunicorn or the app exits unexpectedly. Its logs go to
-standard output/error and are collected by journald:
+`Restart=on-failure` restarts Gunicorn after an unexpected exit. Logs go to
+stdout/stderr and systemd collects them in journald:
 
 ```bash
 journalctl -u users-api -f
+```
+
+To prove automatic recovery during the demo, identify a Gunicorn worker PID,
+kill it, then inspect the restart event:
+
+```bash
+pgrep -a gunicorn
+sudo kill -9 <GUNICORN_PID>
+systemctl status users-api
+journalctl -u users-api -n 50 --no-pager
 ```
 
 ## API
@@ -107,19 +137,12 @@ curl -X POST http://127.0.0.1:8000/api/users \
   -d '{"name":"Lan"}'
 ```
 
-- `GET /api/users` returns records from PostgreSQL.
-- `POST /api/users` accepts a JSON body with non-empty `name` and returns the
-  inserted record with HTTP 201.
-- `GET /health` returns HTTP 200 only if PostgreSQL is reachable.
+- `GET /api/users` returns data from MySQL.
+- `POST /api/users` inserts a record into MySQL and returns HTTP 201.
+- `GET /health` returns HTTP 200 only when MySQL is reachable.
 
-## Nginx reverse proxy example
+## Submission safety
 
-```nginx
-location / {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-}
-```
+Do not include `.env`, `/etc/users-api/users-api.env`, database passwords, or
+private keys in the final `capstone_<group>.tar.gz`. Submit `.env.example` and
+configuration templates only.
